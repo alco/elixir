@@ -48,12 +48,22 @@ compile(Line, Module, Block, RawS) when is_atom(Module) ->
   C = elixir_compiler:get_opts(),
   Filename = S#elixir_scope.filename,
 
+  Orddict = get(elixir_file_module),
+  Orddict1 = case orddict:find(Filename, Orddict) of
+      {ok, _} -> Orddict;
+      error -> orddict:store(Filename, [], Orddict)
+  end,
+  Orddict2 = orddict:append(Filename, Module, Orddict1),
+  put(elixir_file_module, Orddict2),
+
   check_module_availability(Line, Filename, Module, C),
   build(Module),
 
   try
     Result           = eval_form(Line, Filename, Module, Block, S),
     { Funs, Forms0 } = functions_form(Line, Filename, Module, C),
+    %find_refs(Forms0),
+    %io:format("Module ~p (~p):~n~p~n", [Module, Filename, {Forms0}]),
     Forms1           = attributes_form(Line, Filename, Module, Forms0),
 
     elixir_import:ensure_no_local_conflict(Line, Filename, Module, Funs),
@@ -105,8 +115,9 @@ build(Module) ->
 
 eval_form(Line, Filename, Module, Block, RawS) ->
   Temp = ?ELIXIR_ATOM_CONCAT(["COMPILE-",Module]),
+  %io:format("Looking at module ~p~n", [Module]),
   { Binding, S } = binding_and_scope_for_eval([{file,Filename}], Module, [], RawS),
-  { Value, NewS } = elixir_compiler:eval_forms([Block], Line, Temp, S),
+  { Value, NewS } = elixir_compiler:eval_forms([Block], Line, Temp, S, Module),
   elixir_def_overridable:store_pending(Module),
   { Callbacks, FinalS } = callbacks_for(Line, compile_callbacks, Module, [Module], NewS),
   elixir:eval_forms(Callbacks, binding_for_eval(Module, Binding), FinalS#elixir_scope{check_clauses=false}),

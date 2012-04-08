@@ -59,8 +59,9 @@ release: compile test
 ebin:
 	@ $(REBAR) compile
 
-exbin: lib/*.ex lib/*/*.ex
-	@ rm -rf exbin
-	@ mkdir -p exbin
-	@ touch exbin
+.PHONY: exbin
+exbin:
+#	@ rm -rf exbin
+#	@ mkdir -p exbin
+#	@ touch exbin
 	$(ERL) -s elixir_compiler core -s erlang halt

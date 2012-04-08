@@ -1,7 +1,8 @@
 -module(elixir_compiler).
 -export([with_opts/2, set_opts/1, get_opts/0, file/1, file_to_path/2]).
--export([core/0, module/3, eval_forms/4]).
+-export([core/0, module/3, eval_forms/4, eval_forms/5]).
 -include("elixir.hrl").
+-include_lib("kernel/include/file.hrl").
 
 %% Public API
 
@@ -37,6 +38,8 @@ file(Relative) ->
 
   try
     put(elixir_compiled, []),
+    put(elixir_deps, []),
+    put(elixir_file_module, []),
     Contents = case file:read_file(Filename) of
       {ok, Bin} -> unicode:characters_to_list(Bin);
       Error -> erlang:error(Error)
@@ -46,7 +49,13 @@ file(Relative) ->
     eval_forms(Forms, 1, Filename, #elixir_scope{filename=Filename}),
     lists:reverse(get(elixir_compiled))
   after
-    put(elixir_compiled, Previous)
+    put(elixir_compiled, Previous),
+    {ok, Dev} = file:open('file_module_mapping.txt', [append]),
+    io:format(Dev, "~p~n*~n", [get(elixir_file_module)]),
+    file:close(Dev),
+    {ok, Dev1} = file:open('module_dependencies.txt', [append]),
+    io:fwrite(Dev1, "~p~n*~n", [get(elixir_deps)]),
+    file:close(Dev1)
   end.
 
 %% Compiles a file to the given path (directory).
@@ -54,6 +63,31 @@ file(Relative) ->
 file_to_path(File, Path) ->
   Lists = file(File),
   [binary_to_path(X, Path) || X <- Lists].
+
+%%
+
+find_refs({atom, Line, Ref}, Module) ->
+    case atom_to_list(Ref) of
+        "__MAIN__." ++ Other ->
+            %io:format("Found ref ~p~n", [Other]),
+            Orddict = get(elixir_deps),
+            Set = orddict:fetch(Module, Orddict),
+            Uset = ordsets:add_element(Other, Set),
+            put(elixir_deps, orddict:store(Module, Uset, Orddict));
+            %io:format("Found ref ~p~n", [Other]);
+        _Other ->
+            %io:format("Found atom ~p~n", [Other]),
+            {atom, Line, Ref}
+    end;
+
+find_refs(Tree, Module) ->
+    case erl_syntax:subtrees(Tree) of
+            [] -> Tree;
+            List -> erl_syntax:update_tree(Tree,
+                                [[find_refs(Subtree, Module)
+                                  || Subtree <- Group]
+                                 || Group <- List])
+          end.
 
 %% Evaluates the contents/forms by compiling them to an Erlang module.
 
@@ -63,9 +97,30 @@ eval_forms(Forms, Line, Module, #elixir_scope{module=[]} = S) ->
 eval_forms(Forms, Line, Module, #elixir_scope{module=Value} = S) ->
   eval_forms(Forms, Line, Module, Value, S).
 
+eval_forms(Forms, Line, Module, #elixir_scope{module=[]} = S, Mod) ->
+  eval_forms(Forms, Line, Module, nil, S, Mod);
+
+eval_forms(Forms, Line, Module, #elixir_scope{module=Value} = S, Mod) ->
+  eval_forms(Forms, Line, Module, Value, S, Mod);
+
 eval_forms(Forms, Line, RawModule, Value, S) ->
   Module = escape_module(RawModule),
   { Exprs, FS } = elixir_translator:translate(Forms, S),
+  ModuleForm = module_form(Exprs, Line, S#elixir_scope.filename, Module),
+  { module(ModuleForm, S, fun(Mod, _) ->
+    Res = Mod:'BOOTSTRAP'(Value),
+    code:purge(Module),
+    code:delete(Module),
+    Res
+  end), FS }.
+
+eval_forms(Forms, Line, RawModule, Value, S, Modu) when is_atom(Modu) ->
+  Module = escape_module(RawModule),
+  { Exprs, FS } = elixir_translator:translate(Forms, S),
+  Orddict = get(elixir_deps),
+  Orddict2 = orddict:store(Modu, [], Orddict),
+  put(elixir_deps, Orddict2),
+  [ find_refs(Expr, Modu) || Expr <- Exprs],
   ModuleForm = module_form(Exprs, Line, S#elixir_scope.filename, Module),
   { module(ModuleForm, S, fun(Mod, _) ->
     Res = Mod:'BOOTSTRAP'(Value),
@@ -100,12 +155,61 @@ module(Forms, Filename, Options, Callback) ->
 %% Compile core files for bootstrap.
 %% Invoked from the Makefile.
 
+filter_files_mtime([H1|T1], [H2|T2], Acc) ->
+    {ok, SourceInfo} = file:read_file_info(H1, {time, posix}),
+    {ok, CompiledInfo} = file:read_file_info(H2, {time, posix}),
+    case calendar:datetime_to_gregorian_seconds(SourceInfo#file_info.mtime) >
+            calendar:datetime_to_gregorian_seconds(CompiledInfo#file_info.mtime) of
+        true -> filter_files_mtime(T1, T2, [H1|Acc]);
+        false -> filter_files_mtime(T1, T2, Acc)
+    end;
+
+filter_files_mtime([], [], Acc) ->
+    lists:reverse(Acc).
+
+check_compiled_mtime(FileMTime, Modules) ->
+    io:format("File mtime = ~p~n", [FileMTime]),
+    SourceIsNewer = lists:any(fun(Module) ->
+      CompiledPath = make_dir("exbin", atom_to_list(Module), []),
+      io:format("Compiled path = ~p~n", [CompiledPath]),
+      case filelib:last_modified(CompiledPath) of
+          0 -> true;
+          DateTime ->
+              io:format("Module mtime = ~p~n", [DateTime]),
+              calendar:datetime_to_gregorian_seconds(FileMTime) > calendar:datetime_to_gregorian_seconds(DateTime)
+      end
+    end, Modules),
+    SourceIsNewer.
+
 core() ->
   put(elixir_compiler_opts, #elixir_compile{internal=true}),
-  [core_file(File) || File <- core_main()],
-  AllLists = [filelib:wildcard(Wildcard) || Wildcard <- core_list()],
-  Files = lists:append(AllLists) -- core_main(),
-  [core_file(File) || File <- '__MAIN__.List':uniq(Files)].
+
+  % Check if we have the dependency graph stored in the exbin/elixir_deps.graph file
+  case file:consult("elixir_deps.graph") of
+      {ok, [FileModuleDict]} ->
+          % build a list of candidate files: those that are newer than their corresponding .beam files
+          Candidates = lists:append(core_main(), [filelib:wildcard(Wildcard) || Wildcard <- core_list()]),
+          % for each file determine which modules it contains
+          NewFiles = lists:filter(fun(Filename) ->
+                      MDate = filelib:last_modified(Filename),
+                      case orddict:find(Filename, FileModuleDict) of
+                          {ok, Modules} ->
+                              % check if any of the compiled modules is older than the file
+                              SourceIsNewer = check_compiled_mtime(MDate, Modules),
+                              SourceIsNewer;
+                          error ->
+                              false
+                      end
+                     end, Candidates),
+          io:format("CompilationCandidates = ~p~n", [NewFiles]);
+      {error, _Reason} ->
+          io:format("Error reading deps graph with reason ~p~n", [_Reason]),
+          % compile all core files and build the graph
+         [core_file(File) || File <- core_main()],
+         AllLists = [filelib:wildcard(Wildcard) || Wildcard <- core_list()],
+         Files = lists:append(AllLists) -- core_main(),
+         [core_file(File) || File <- '__MAIN__.List':uniq(Files)]
+  end.
 
 %% HELPERS
 
