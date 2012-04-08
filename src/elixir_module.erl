@@ -48,13 +48,18 @@ compile(Line, Module, Block, RawS) when is_atom(Module) ->
   C = elixir_compiler:get_opts(),
   Filename = S#elixir_scope.filename,
 
-  Orddict = get(elixir_file_module),
-  Orddict1 = case orddict:find(Filename, Orddict) of
-      {ok, _} -> Orddict;
-      error -> orddict:store(Filename, [], Orddict)
+  io:format("Looking at MODULE ~p in file ~p~n", [Module, Filename]),
+
+  case get(elixir_file_module) of
+      undefined -> ok;
+      Orddict ->
+        Orddict1 = case orddict:find(Filename, Orddict) of
+            {ok, _} -> Orddict;
+            error -> orddict:store(Filename, [], Orddict)
+        end,
+        Orddict2 = orddict:append(Filename, Module, Orddict1),
+        put(elixir_file_module, Orddict2)
   end,
-  Orddict2 = orddict:append(Filename, Module, Orddict1),
-  put(elixir_file_module, Orddict2),
 
   check_module_availability(Line, Filename, Module, C),
   build(Module),
@@ -115,7 +120,6 @@ build(Module) ->
 
 eval_form(Line, Filename, Module, Block, RawS) ->
   Temp = ?ELIXIR_ATOM_CONCAT(["COMPILE-",Module]),
-  %io:format("Looking at module ~p~n", [Module]),
   { Binding, S } = binding_and_scope_for_eval([{file,Filename}], Module, [], RawS),
   { Value, NewS } = elixir_compiler:eval_forms([Block], Line, Temp, S, Module),
   elixir_def_overridable:store_pending(Module),

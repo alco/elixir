@@ -38,8 +38,6 @@ file(Relative) ->
 
   try
     put(elixir_compiled, []),
-    put(elixir_deps, []),
-    put(elixir_file_module, []),
     Contents = case file:read_file(Filename) of
       {ok, Bin} -> unicode:characters_to_list(Bin);
       Error -> erlang:error(Error)
@@ -50,11 +48,8 @@ file(Relative) ->
     lists:reverse(get(elixir_compiled))
   after
     put(elixir_compiled, Previous),
-    {ok, Dev} = file:open('file_module_mapping.txt', [append]),
-    io:format(Dev, "~p~n*~n", [get(elixir_file_module)]),
-    file:close(Dev),
-    {ok, Dev1} = file:open('module_dependencies.txt', [append]),
-    io:fwrite(Dev1, "~p~n*~n", [get(elixir_deps)]),
+    {ok, Dev1} = file:open('module_dependencies.txt', [write]),
+    io:fwrite(Dev1, "~p.", [get(elixir_deps)]),
     file:close(Dev1)
   end.
 
@@ -168,27 +163,38 @@ filter_files_mtime([], [], Acc) ->
     lists:reverse(Acc).
 
 check_compiled_mtime(FileMTime, Modules) ->
-    io:format("File mtime = ~p~n", [FileMTime]),
+    %io:format("File mtime = ~p~n", [FileMTime]),
     SourceIsNewer = lists:any(fun(Module) ->
       CompiledPath = make_dir("exbin", atom_to_list(Module), []),
-      io:format("Compiled path = ~p~n", [CompiledPath]),
+      %io:format("Compiled path = ~p~n", [CompiledPath]),
       case filelib:last_modified(CompiledPath) of
           0 -> true;
           DateTime ->
-              io:format("Module mtime = ~p~n", [DateTime]),
+              %io:format("Module mtime = ~p~n", [DateTime]),
               calendar:datetime_to_gregorian_seconds(FileMTime) > calendar:datetime_to_gregorian_seconds(DateTime)
       end
     end, Modules),
     SourceIsNewer.
 
+orddict_to_json(Dict) ->
+    Json = orddict:fold(fun(Key, Val, Acc) ->
+                          lists:append(Acc, io_lib:format("\"~s\": ~p,~n", [Key, Val]))
+                        end, "{", Dict),
+    lists:append(Json, "\"\": \"\"}").
+
 core() ->
   put(elixir_compiler_opts, #elixir_compile{internal=true}),
 
+  put(elixir_file_module, []),
+  put(elixir_deps, []),
   % Check if we have the dependency graph stored in the exbin/elixir_deps.graph file
-  case file:consult("elixir_deps.graph") of
+  case file:consult("elixir_file_module.map") of
       {ok, [FileModuleDict]} ->
           % build a list of candidate files: those that are newer than their corresponding .beam files
-          Candidates = lists:append(core_main(), [filelib:wildcard(Wildcard) || Wildcard <- core_list()]),
+          {ok, Dev} = file:open("candidates.txt", [write]),
+          Candidates = lists:map(fun(Filename) -> filename:absname(Filename) end,
+              lists:append(core_main(), lists:append([filelib:wildcard(Wildcard) || Wildcard <- core_list()]))),
+          io:format(Dev, "Initial list: ~p~n****~n", [Candidates]),
           % for each file determine which modules it contains
           NewFiles = lists:filter(fun(Filename) ->
                       MDate = filelib:last_modified(Filename),
@@ -201,14 +207,26 @@ core() ->
                               false
                       end
                      end, Candidates),
-          io:format("CompilationCandidates = ~p~n", [NewFiles]);
+          io:format(Dev, "CompilationCandidates = ~p~n", [NewFiles]),
+          file:close(Dev);
       {error, _Reason} ->
           io:format("Error reading deps graph with reason ~p~n", [_Reason]),
           % compile all core files and build the graph
          [core_file(File) || File <- core_main()],
          AllLists = [filelib:wildcard(Wildcard) || Wildcard <- core_list()],
          Files = lists:append(AllLists) -- core_main(),
-         [core_file(File) || File <- '__MAIN__.List':uniq(Files)]
+         [core_file(File) || File <- '__MAIN__.List':uniq(Files)],
+
+         % Extract file -> module mapping built during compilation and store it in the elixir_file_module.map file
+         {ok, Dev} = file:open("elixir_file_module.map", [write]),
+         io:format(Dev, "~p.", [get(elixir_file_module)]),
+         file:close(Dev),
+
+         {ok, Dev1} = file:open('module_dependencies.txt', [write]),
+         JSON = orddict_to_json(get(elixir_deps)),
+         io:fwrite(Dev1, "~s", [JSON]),
+         file:close(Dev1)
+
   end.
 
 %% HELPERS
