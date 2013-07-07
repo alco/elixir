@@ -1,13 +1,15 @@
 defmodule URI do
   @moduledoc """
   Utilities for working with and creating URIs.
+
+  In order to make sure that all URIs that are handled by user code are valid,
+  use `URI.parse/1` to convert a properly escaped URI string into a `URI.Info`
+  record and `to_binary/1` to convert a `URI.Info` record to a string.
   """
 
   defrecord Info, [scheme: nil, path: nil, query: nil,
                    fragment: nil, authority: nil,
                    userinfo: nil, host: nil, port: nil]
-
-  import Bitwise
 
   @ports [
     { "ftp", 21 },
@@ -19,7 +21,7 @@ defmodule URI do
   ]
 
   Enum.each @ports, fn { scheme, port } ->
-    def normalize_scheme(unquote(scheme)), do: unquote(scheme)
+    #def normalize_scheme(unquote(scheme)), do: unquote(scheme)
     def default_port(unquote(scheme)),     do: unquote(port)
   end
 
@@ -31,8 +33,10 @@ defmodule URI do
 
   @doc """
   Returns the default port for a given scheme.
-  If the scheme is unknown to URI, returns nil.
-  Any scheme may be registered via `URI.default_port/2`.
+
+  If the scheme is not known to URI, returns nil.
+
+  A new scheme can be registered via `URI.default_port/2`.
   """
   def default_port(scheme) when is_binary(scheme) do
     { :ok, dict } = :application.get_env(:elixir, :uri)
@@ -40,7 +44,8 @@ defmodule URI do
   end
 
   @doc """
-  Registers a scheme with a default port into Elixir.
+  Registers a default port for `scheme` in the context of the currently running
+  Elixir application.
   """
   def default_port(scheme, port) when is_binary(scheme) and port > 0 do
     { :ok, dict } = :application.get_env(:elixir, :uri)
@@ -54,7 +59,9 @@ defmodule URI do
   that implements the Binary.Chars protocol (i.e. can be converted
   to binary).
   """
-  def encode_query(l), do: Enum.map_join(l, "&", pair(&1))
+  # format is one of:
+  # * :form
+  def encode_query(l, format), do: Enum.map_join(l, "&", pair(&1))
 
   @doc """
   Given a query string of the form "key1=value1&key=value2...", produces an
@@ -63,7 +70,9 @@ defmodule URI do
 
   Use decoder/1 if you want to customize or iterate each value manually.
   """
-  def decode_query(q, dict // HashDict.new) when is_binary(q) do
+  # format is one of:
+  # * :form
+  def decode_query(q, format, dict // HashDict.new) when is_binary(q) do
     Enum.reduce query_decoder(q), dict, fn({ k, v }, acc) -> Dict.put(acc, k, v) end
   end
 
@@ -101,49 +110,47 @@ defmodule URI do
     encode(to_binary(k)) <> "=" <> encode(to_binary(v))
   end
 
-  @doc """
-  Percent (URL) encodes a URI.
-  """
-  def encode(s), do: bc(<<c>> inbits s, do: <<percent(c) :: binary>>)
+  ###
 
-  defp percent(32), do: <<?+>>
-  defp percent(?-), do: <<?->>
-  defp percent(?_), do: <<?_>>
-  defp percent(?.), do: <<?.>>
+  defp percent_encode(s) when is_binary(s), do:
+    bc <<c>> inbits s, do: <<percent(c) :: binary>>
 
-  defp percent(c)
-      when c >= ?0 and c <= ?9
-      when c >= ?a and c <= ?z
-      when c >= ?A and c <= ?Z do
-    <<c>>
-  end
+  # The so called "unreserved" characters need not be escaped
+  defp percent_encode(c)
+    when (c in ?0..?9)
+      or (c in ?a..?z)
+      or (c in ?A..?Z)
+      or (c in [?-, ?., ?_, ?~]),
+    do: <<c>>
 
-  defp percent(c), do: "%" <> hex(bsr(c, 4)) <> hex(band(c, 15))
+  # The rest of the characters are escaped
+  defp percent(c), do: "%" <> hex_byte(<<c>>)
 
-  defp hex(n) when n <= 9, do: <<n + ?0>>
-  defp hex(n), do: <<n + ?A - 10>>
+  ###
 
-  @doc """
-  Unpercent (URL) decodes a URI.
-  """
-  def decode(<<?%, hex1, hex2, tail :: binary >>) do
-    << bsl(hex2dec(hex1), 4) + hex2dec(hex2) >> <> decode(tail)
-  end
+  defp percent_decode(<<?%, hex1, hex2, tail :: binary>>), do:
+    << hex2dec(hex1) :: size(4),
+       hex2dec(hex2) :: size(4) >> <> percent_decode(tail)
 
-  def decode(<<head, tail :: binary >>) do
-    <<check_plus(head)>> <> decode(tail)
-  end
+  defp percent_decode(<<head, tail :: binary>>), do:
+    <<head>> <> percent_decode(tail)
 
-  def decode(<<>>), do: <<>>
+  defp percent_decode(<<>>), do: <<>>
 
-  defp hex2dec(n) when n in ?A..?F, do: n - ?A + 10
+  ###
+
+  defp hex_byte(<<hi :: size(4), lo :: size(4)>>), do:
+    <<dec2hex(hi)>> <> <<dec2hex(lo)>>
+
+  defp dec2hex(n) when n in 0..9,   do: ?0 + n
+  defp dec2hex(n) when n in 10..15, do: ?A + n - 10
+
   defp hex2dec(n) when n in ?0..?9, do: n - ?0
-
-  defp check_plus(?+), do: 32
-  defp check_plus(c),  do: c
+  defp hex2dec(n) when n in ?A..?F, do: n - ?A + 10
+  defp hex2dec(n) when n in ?a..?f, do: n - ?a + 10
 
   @doc """
-  Parses a URI into components.
+  Parses a URI into URI.Info record.
 
   URIs have portions that are handled specially for the
   particular scheme of the URI. For example, http and https
@@ -160,23 +167,11 @@ defmodule URI do
   for that particular scheme. Take a look at URI.HTTPS for an
   example of one of these extension modules.
   """
-  def parse(s) when is_binary(s) do
-    # From http://tools.ietf.org/html/rfc3986#appendix-B
-    regex = %r/^(([^:\/?#]+):)?(\/\/([^\/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/
-    parts = nillify(Regex.run(regex, s))
+  def parse(uri_string) when is_binary(uri_string) do
+    { scheme, authority, path, query, fragment }
+      = parse_components(uri_string) |> normalize_components()
 
-    destructure [_, _, scheme, _, authority, path, _, query, _, fragment], parts
-    { userinfo, host, port } = split_authority(authority)
-
-    if authority do
-      authority = ""
-
-      if userinfo, do: authority = authority <> userinfo <> "@"
-      if host, do: authority = authority <> host
-      if port, do: authority = authority <> ":" <> integer_to_binary(port)
-    end
-
-    scheme = normalize_scheme(scheme)
+    { useinfo, host, port } = split_authority(scheme, authority)
 
     if nil?(port) and not nil?(scheme) do
       port = default_port(scheme)
@@ -189,11 +184,70 @@ defmodule URI do
     ]
   end
 
+  @doc """
+  Parses a URI into the following components:
+
+      { <scheme>, <authority>, <path>, <query>, <fragment> }
+
+  if `path`, `query`, or `fragment` are missing in the given string, `nil` is
+  returned for the corresponding tuple places.
+  """
+  def parse_components(uri_string) when is_binary(uri_string) do
+    # From http://tools.ietf.org/html/rfc3986#appendix-B
+    regex = %r/^(([^:\/?#]+):)?(\/\/([^\/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/
+    parts = nillify(Regex.run(regex, uri_string))
+
+    destructure [
+      __full_string,
+      __scheme_with_colon,
+      scheme,
+      __authority_with_slashes,
+      authority,
+      path,
+      __query_with_question_mark,
+      query,
+      __fragment_with_hash,
+      fragment
+    ], parts
+
+    { scheme, authority, path, query, fragment }
+  end
+
+  defp normalize_components({ scheme, authority, path, query, fragment }) do
+    scheme = normalize_scheme(scheme)
+    authority = authority |> percent_decode() |> normalize_authority()
+    path = percent_decode(path)
+    query = query
+    fragment = percent_decode(fragment)
+
+    { scheme, authority, path, query, fragment }
+  end
+
+  defp normalize_authority("") do
+    ""
+  end
+
+  defp normalize_authority(authority) do
+    { userinfo, host, port } = split_authority(authority)
+
+    authority = ""
+    if userinfo, do: authority = authority <> userinfo <> "@"
+    if host, do: authority = authority <> host
+    if port, do: authority = authority <> ":" <> integer_to_binary(port)
+    authority
+  end
+
   # Split an authority into its userinfo, host and port parts.
-  defp split_authority(s) do
-    s = s || ""
-    components = Regex.run %r/(^(.*)@)?([^:]*)(:(\d*))?/, s
-    destructure [_, _, userinfo, host, _, port], nillify(components)
+  #
+  # Note: some schemes only allow the host part, in which case userinfo and
+  # port will be set to `nil`.
+  defp split_authority(scheme, nil) do
+    { nil, nil, nil }
+  end
+
+  defp split_authority(scheme, authority) do
+    components = nillify(Regex.run(%r/(^(.*)@)?([^:]*)(:(\d*))?/, authority))
+    destructure [_, _, userinfo, host, _, port], components
     port = if port, do: binary_to_integer(port)
     { userinfo, host, port }
   end
@@ -204,6 +258,12 @@ defmodule URI do
     lc s inlist l do
       if size(s) > 0, do: s, else: nil
     end
+  end
+
+  @doc """
+  Verifies that the given string contains a well formed URI.
+  """
+  def valid?(uri_string) when is_binary(uri_string) do
   end
 end
 
@@ -217,13 +277,16 @@ defimpl Binary.Chars, for: URI.Info do
 
     result = ""
 
+    authority = build_authority(uri)
+
     if uri.scheme,   do: result = result <> uri.scheme <> "://"
-    if uri.userinfo, do: result = result <> uri.userinfo <> "@"
-    if uri.host,     do: result = result <> uri.host
-    if uri.port,     do: result = result <> ":" <> integer_to_binary(uri.port)
-    if uri.path,     do: result = result <> uri.path
-    if uri.query,    do: result = result <> "?" <> uri.query
-    if uri.fragment, do: result = result <> "#" <> uri.fragment
+    if authority,    do: result = result <> percent_encode(authority)
+    #if uri.userinfo, do: result = result <> uri.userinfo <> "@"
+    #if uri.host,     do: result = result <> uri.host
+    #if uri.port,     do: result = result <> ":" <> integer_to_binary(uri.port)
+    if uri.path,     do: result = result <> percent_encode(uri.path)
+    if uri.query,    do: result = result <> "?" <> escape_query(uri.query)
+    if uri.fragment, do: result = result <> "#" <> percent_encode(uri.fragment)
 
     result
   end
