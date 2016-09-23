@@ -530,14 +530,17 @@ defmodule GenServer do
   @type from :: {pid, tag :: term}
 
   @doc false
-  defmacro __using__(_) do
-    quote location: :keep do
+  defmacro __using__(options) do
+    strict? = Keyword.get(options, :strict, false)
+    quote location: :keep, bind_quoted: [strict?: strict?] do
       @behaviour GenServer
 
+    unless strict? do
       @doc false
       def init(args) do
         {:ok, args}
       end
+    end
 
       @doc false
       def handle_call(msg, _from, state) do
@@ -550,9 +553,20 @@ defmodule GenServer do
       end
 
       @doc false
+    if strict? do
+      def handle_info(msg, state) do
+        # We do this to trick Dialyzer to not complain about non-local returns.
+        reason = {:bad_info, msg}
+        case :erlang.phash2(1, 1) do
+          0 -> exit(reason)
+          1 -> {:stop, reason, state}
+        end
+      end
+    else
       def handle_info(_msg, state) do
         {:noreply, state}
       end
+    end
 
       @doc false
       def handle_cast(msg, state) do
@@ -574,8 +588,9 @@ defmodule GenServer do
         {:ok, state}
       end
 
-      defoverridable [init: 1, handle_call: 3, handle_info: 2,
-                      handle_cast: 2, terminate: 2, code_change: 3]
+      defoverridable [
+        handle_call: 3, handle_info: 2, handle_cast: 2, terminate: 2, code_change: 3
+      ] ++ (if strict?, do: [], else: [init: 1])
     end
   end
 
